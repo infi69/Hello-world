@@ -26,7 +26,7 @@ def get_leaves(item,key=None):
 
 #with open(r'D:\aziz_accounting\01_02_2019\Companies.json') as f_input,
     
- 
+ 'review'
 with open(r'D:\aziz_accounting\01_02_2019\Comapnies.csv', 'w+', newline='') as f_output:
     data=[line for line in open(r'D:\aziz_accounting\01_02_2019\Companies.json','r')]
     write_header = True
