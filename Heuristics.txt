@@ -1,0 +1,14 @@
+Heuristics,
+1.	smaller cros with low roi_h and roi_w are not decoded <100 and <100
+2.	High quite zone scores are decode   >0.8-
+3.	Low quite zone score with high lap_Score and edge_boder_ration is decoded
+4.	Overall barcode scores should be above 0.70
+5.	High barcode score with high roi_h and roi_w will be definiely decoded
+6.	High quiet zone score is contributing in high barcode score
+7.	If below metrics 
+barcode_score >= 0.65
+quiet_zone_score >= 0.12
+glare_border_ratio <= 0.25
+edge_density between 0.05 and 0.20
+contrast >= 50
+If these all pass, the crop is likely decodeable.
