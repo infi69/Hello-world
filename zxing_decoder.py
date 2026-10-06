@@ -199,6 +199,77 @@ def _sharpen_image(img):
     return cv2.filter2D(img, -1, kernel)
 
 
+def _is_label_like_input(img):
+    """Return True only for large document/label images that may contain a small barcode."""
+    if img is None or img.size == 0:
+        return False
+
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
+
+    h, w = gray.shape[:2]
+    if min(h, w) < 80:
+        return False
+
+    aspect = max(h, w) / max(1, min(h, w))
+    if min(h, w) <= 220 and aspect <= 1.6:
+        return False
+
+    # Large, non-compact images are more likely to be labels or package sheets.
+    return max(h, w) > 250 or aspect > 1.6
+
+
+def _isolate_label_like_candidates(img, max_candidates=4, show_preview=False):
+    """Only run for full label/document inputs. Returns a dict of likely barcode candidates."""
+    if img is None or img.size == 0:
+        return {"raw": img}
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 200)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    candidates = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 200:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w <= 0 or h <= 0:
+            continue
+        aspect = max(w, h) / max(1, min(w, h))
+        if aspect > 1.8:
+            continue
+        if min(w, h) < 20:
+            continue
+        crop = img[y:y + h, x:x + w]
+        if crop is None or crop.size == 0:
+            continue
+        candidates.append((area, crop))
+
+    if not candidates:
+        return {"raw": img}
+
+    # Favor bigger compact squares, but limit to a few candidates.
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    result = {}
+    for idx, (_, crop) in enumerate(candidates[:max_candidates]):
+        key = f"label_candidate_{idx}"
+        result[key] = crop
+        if show_preview:
+            try:
+                preview = crop.copy()
+                if len(preview.shape) == 2:
+                    preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
+                cv2.imshow(f"isolated_candidate_{idx}", preview)
+                cv2.waitKey(1)
+            except Exception:
+                pass
+    return result if result else {"raw": img}
+
+
 def _barcode_likeness_score(img):
     """
     Heuristic score: higher means more likely to be a barcode.
@@ -309,6 +380,15 @@ def decode_roi_until_success(
         {"binarizer": "LOCAL_AVERAGE", "try_downscale": True},
     ]
 
+    # Important: only isolate large label/document images. An already-localized ROI should
+    # skip this, otherwise we repeatedly re-detect squares inside a barcode-like crop.
+    if _is_label_like_input(roi):
+        candidate_crops = _isolate_label_like_candidates(roi, show_preview=debug)
+        if debug:
+            print(f"Label-style input detected; isolating {len(candidate_crops)} candidate region(s).")
+    else:
+        candidate_crops = {"raw": roi}
+
     best_text = None
     best_format = None
     best_meta = None
@@ -331,8 +411,12 @@ def decode_roi_until_success(
         square_size = square_sizes[(pass_idx - 1) % len(square_sizes)]
         rotation = rotations[(pass_idx - 1) % len(rotations)]
 
-        # Build a batch of candidate crops for this pass
-        candidate_crops = {"raw": roi}
+        # Build a batch of candidate crops for this pass.
+        # For already-localized barcode crops, skip label isolation entirely.
+        if _is_label_like_input(roi):
+            candidate_crops = _isolate_label_like_candidates(roi)
+        else:
+            candidate_crops = {"raw": roi}
 
         # 1) perspective rectification using tuned contour params
         rectified = _rectify_perspective_from_edges(
