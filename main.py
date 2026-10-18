@@ -4,6 +4,7 @@ Self-contained DataMatrix decode pipeline for pre-cropped ROIs in test-crops/.
 Strategy:
   1) Generate preprocessing variants and try ZXing (DataMatrix only) — fast path
   2) On failure, run an aggressive multi-pass decoder (perspective / pad / rotate / configs)
+  3) On failure, finder-guided ECC200 reconstruction (grid fit + erasure-aware Reed-Solomon)
 
 Outputs:
   - Console progress
@@ -34,6 +35,11 @@ import cv2
 import numpy as np
 import torch
 import zxingcpp
+
+try:
+    import reedsolo
+except ImportError:  # ECC stage is skipped when missing
+    reedsolo = None
 
 from datamatrix_unet import DataMatrixUNet, predict_probability_map, render_probability_map
 
@@ -836,11 +842,20 @@ def _find_datamatrix_unet_checkpoint() -> str | None:
     for root in search_roots:
         if not root.exists():
             continue
-        for pattern in ("datamatrix_unet_epoch_*.pt", "datamatrix_unet_epoch_*.pth"):
+        for pattern in ("datamatrix_unet*_epoch_*.pt", "datamatrix_unet*_epoch_*.pth"):
             epoch_candidates.extend(root.glob(pattern))
 
+    merged_candidates = [
+        path for path in epoch_candidates if "merged" in path.name.casefold()
+    ]
+    if merged_candidates:
+        epoch_candidates = merged_candidates
+
     if epoch_candidates:
-        latest = max(epoch_candidates, key=lambda p: _extract_epoch_number(p))
+        latest = max(
+            epoch_candidates,
+            key=lambda p: (_extract_epoch_number(p), p.stat().st_mtime),
+        )
         return str(latest)
 
     return None
@@ -868,7 +883,10 @@ def _load_datamatrix_unet_model(model_path: str | None = None) -> DataMatrixUNet
         return None
 
 
-def _datamatrix_unet_reconstruction_candidates(roi: np.ndarray) -> list[tuple[str, np.ndarray, float, dict[str, float]]]:
+def _datamatrix_unet_reconstruction_candidates(
+    roi: np.ndarray,
+    geometry_candidates: list[tuple[str, np.ndarray, float, dict[str, float]]] | None = None,
+) -> list[tuple[str, np.ndarray, float, dict[str, float]]]:
     """Try a trained DataMatrix U-Net reconstruction as an additional candidate source."""
     if roi is None or roi.size == 0:
         return []
@@ -879,25 +897,47 @@ def _datamatrix_unet_reconstruction_candidates(roi: np.ndarray) -> list[tuple[st
 
     try:
         prob = predict_probability_map(model, roi)
-        binary = (prob > 0.5).astype(np.uint8)
-        if binary.size == 0:
+        if prob.size == 0 or prob.ndim != 2:
             return []
 
-        rendered = render_probability_map(prob, module_px=12, quiet_zone=2)
-        score = float(_barcode_likeness_score(rendered))
-        border_score = float(0.5 + 0.5 * score)
-        dark_ratio = float(binary.mean())
-        if dark_ratio <= 0.05 or dark_ratio >= 0.95:
+        grid_scores: dict[int, float] = {}
+        for name, _, geometry_score, _ in geometry_candidates or []:
+            if "|n" not in name:
+                continue
+            try:
+                grid_size = int(name.rsplit("|n", 1)[1])
+            except ValueError:
+                continue
+            if 10 <= grid_size <= 64:
+                grid_scores[grid_size] = max(grid_scores.get(grid_size, 0.0), float(geometry_score))
+
+        if not grid_scores:
             return []
 
-        return [
-            (
-                "reconstruct|unet|prob05",
-                rendered,
-                border_score,
-                {"border_score": border_score, "pitch_range_ratio": 1.0, "dark_ratio": dark_ratio},
+        candidates: list[tuple[str, np.ndarray, float, dict[str, float]]] = []
+        for grid_size, geometry_score in grid_scores.items():
+            module_prob = cv2.resize(
+                prob.astype(np.float32),
+                (grid_size, grid_size),
+                interpolation=cv2.INTER_AREA,
             )
-        ]
+            grid = (module_prob >= 0.5).astype(np.uint8)
+            dark_ratio = float(grid.mean())
+            if dark_ratio < 0.01 or dark_ratio > 0.99:
+                continue
+
+            rendered = _render_grid_to_bitmap(grid, module_px=6, quiet_zone=2)
+            meta = {
+                "border_score": geometry_score,
+                "pitch_range_ratio": 1.0,
+                "dark_ratio": dark_ratio,
+                "grid_size": float(grid_size),
+                "unet_border_score": float(_datamatrix_border_score(grid)),
+            }
+            candidates.append((f"reconstruct|unet|n{grid_size}", rendered, geometry_score, meta))
+
+        candidates.sort(key=lambda item: item[2], reverse=True)
+        return candidates[:4]
     except Exception:
         return []
 
@@ -1463,7 +1503,7 @@ def _reconstruction_decode(roi: np.ndarray, steps: list[StepLog]) -> dict[str, A
 
     candidate_rows: list[dict[str, Any]] = []
     recon_candidates = _reconstruct_datamatrix_candidates(roi)
-    unet_candidates = _datamatrix_unet_reconstruction_candidates(roi)
+    unet_candidates = _datamatrix_unet_reconstruction_candidates(roi, recon_candidates)
     if unet_candidates:
         recon_candidates = unet_candidates + recon_candidates
     steps.append(
@@ -1589,6 +1629,21 @@ def _reconstruction_decode(roi: np.ndarray, steps: list[StepLog]) -> dict[str, A
             )
         )
 
+    # Last resort inside the reconstruction fallback: L-finder-aware grid fit + Reed-Solomon repair.
+    ecc = _ecc_reconstruction_decode(roi, steps)
+    candidate_rows.extend(ecc.get("candidate_rows", []))
+    if ecc["decoded"]:
+        return {
+            "decoded": True,
+            "text": ecc["text"],
+            "format": ecc["format"],
+            "variant": ecc["variant"],
+            "attempts": len(recon_candidates) + int(ecc["attempts"]),
+            "steps": ecc["steps"],
+            "reason": "decoded_reconstruction",
+            "candidate_rows": candidate_rows,
+        }
+
     return {
         "decoded": False,
         "text": "",
@@ -1599,6 +1654,279 @@ def _reconstruction_decode(roi: np.ndarray, steps: list[StepLog]) -> dict[str, A
         "reason": "reconstruction_failed",
         "candidate_rows": candidate_rows,
     }
+
+
+# ===========================================================================
+# Finder-guided ECC200 reconstruction (grid fit + erasure-aware Reed-Solomon)
+# ===========================================================================
+# size -> (data codewords, ecc codewords); single-block square symbols only
+_DM_ECC = {10: (3, 5), 12: (5, 7), 14: (8, 10), 16: (12, 12), 18: (18, 14), 20: (22, 18),
+           22: (30, 20), 24: (36, 24), 26: (44, 28)}
+_DM_ECC_SIZES = (22, 20, 24, 18, 26, 16)
+_DM_ECC_SPARE = 8  # ECC symbols kept unused so a wrong correction is statistically ~impossible
+_DM_PLACEMENT_CACHE: dict[int, list] = {}
+
+
+def _dm_placement(n: int) -> list:
+    """ECC200 placement (ISO 16022 Annex F) for the (n-2)x(n-2) data region: [r][c] = (codeword, bit0=MSB) or None."""
+    if n in _DM_PLACEMENT_CACHE:
+        return _DM_PLACEMENT_CACHE[n]
+    nrow = ncol = n - 2
+    arr: list[list[Any]] = [[None] * ncol for _ in range(nrow)]
+    used = [[False] * ncol for _ in range(nrow)]
+
+    def module(row: int, col: int, chr_: int, bit: int) -> None:
+        if row < 0:
+            row += nrow
+            col += 4 - ((nrow + 4) % 8)
+        if col < 0:
+            col += ncol
+            row += 4 - ((ncol + 4) % 8)
+        arr[row][col] = (chr_ - 1, bit)
+        used[row][col] = True
+
+    def utah(row: int, col: int, chr_: int) -> None:
+        for bit, (dr, dc) in enumerate([(-2, -2), (-2, -1), (-1, -2), (-1, -1), (-1, 0), (0, -2), (0, -1), (0, 0)]):
+            module(row + dr, col + dc, chr_, bit)
+
+    def corner(chr_: int, cells: list[tuple[int, int]]) -> None:
+        for bit, (r, c) in enumerate(cells):
+            module(r, c, chr_, bit)
+
+    chr_, row, col = 1, 4, 0
+    while True:
+        if row == nrow and col == 0:
+            corner(chr_, [(nrow - 1, 0), (nrow - 1, 1), (nrow - 1, 2), (0, ncol - 2), (0, ncol - 1), (1, ncol - 1), (2, ncol - 1), (3, ncol - 1)])
+            chr_ += 1
+        if row == nrow - 2 and col == 0 and ncol % 4:
+            corner(chr_, [(nrow - 3, 0), (nrow - 2, 0), (nrow - 1, 0), (0, ncol - 4), (0, ncol - 3), (0, ncol - 2), (0, ncol - 1), (1, ncol - 1)])
+            chr_ += 1
+        if row == nrow - 2 and col == 0 and ncol % 8 == 4:
+            corner(chr_, [(nrow - 3, 0), (nrow - 2, 0), (nrow - 1, 0), (0, ncol - 2), (0, ncol - 1), (1, ncol - 1), (2, ncol - 1), (3, ncol - 1)])
+            chr_ += 1
+        if row == nrow + 4 and col == 2 and ncol % 8 == 0:
+            corner(chr_, [(nrow - 1, 0), (nrow - 1, ncol - 1), (0, ncol - 3), (0, ncol - 2), (0, ncol - 1), (1, ncol - 3), (1, ncol - 2), (1, ncol - 1)])
+            chr_ += 1
+        while True:
+            if row < nrow and col >= 0 and not used[row][col]:
+                utah(row, col, chr_)
+                chr_ += 1
+            row -= 2
+            col += 2
+            if not (row >= 0 and col < ncol):
+                break
+        row += 1
+        col += 3
+        while True:
+            if row >= 0 and col < ncol and not used[row][col]:
+                utah(row, col, chr_)
+                chr_ += 1
+            row += 2
+            col -= 2
+            if not (row < nrow and col >= 0):
+                break
+        row += 3
+        col += 1
+        if not (row < nrow or col < ncol):
+            break
+    _DM_PLACEMENT_CACHE[n] = arr
+    return arr
+
+
+def _dm_grid_to_codewords(data_bits: np.ndarray, margin: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+    pl = _dm_placement(n)
+    ncw = sum(_DM_ECC[n])
+    cw = np.zeros(ncw, int)
+    conf = np.full(ncw, 9.0)
+    for r in range(n - 2):
+        for c in range(n - 2):
+            p = pl[r][c]
+            if p is None or p[0] >= ncw:
+                continue
+            cw[p[0]] |= int(data_bits[r, c]) << (7 - p[1])
+            conf[p[0]] = min(conf[p[0]], margin[r, c])
+    return cw, conf
+
+
+def _dm_codewords_to_bitmap(cw: np.ndarray, n: int, px: int = 10, quiet: int = 4) -> np.ndarray:
+    """Render a clean symbol (finder L + clock + placed codewords) as dark-on-white."""
+    nd = n - 2
+    pl = _dm_placement(n)
+    bits = np.zeros((n, n), int)
+    bits[:, 0] = 1
+    bits[-1, :] = 1
+    for i in range(n):
+        bits[0, i] = int(i % 2 == 0)
+        bits[i, -1] = int((n - 1 - i) % 2 == 0)
+    bits[0, 0] = 1
+    bits[-1, -1] = 1
+    for r in range(nd):
+        for c in range(nd):
+            p = pl[r][c]
+            if p is not None:
+                bits[r + 1, c + 1] = (int(cw[p[0]]) >> (7 - p[1])) & 1
+    if pl[nd - 1][nd - 1] is None:  # fill pattern in lower-right corner
+        bits[nd, nd] = bits[nd - 1, nd - 2] = 1
+        bits[nd - 1, nd - 1] = bits[nd, nd - 1] = 0
+    img = np.kron((1 - bits) * 255, np.ones((px, px))).astype(np.uint8)
+    return cv2.copyMakeBorder(img, quiet * px, quiet * px, quiet * px, quiet * px, cv2.BORDER_CONSTANT, value=255)
+
+
+def _dm_locate_quad(gray: np.ndarray) -> np.ndarray:
+    """4 corners of the symbol: tight hull of dark pixels, else min-area rect of the dense dark region."""
+    blur = cv2.GaussianBlur(gray, (0, 0), 1.2)
+    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+                                  (min(gray.shape) // 4) | 1, 8)
+    dark = cv2.bitwise_or(otsu, adapt)  # adaptive part keeps shaded/low-contrast sides of the symbol
+    k = max(5, int(min(gray.shape) * 0.06)) | 1
+    dens = cv2.blur((dark > 0).astype(np.float32), (k, k))
+    mask = cv2.morphologyEx((dens > 0.15).astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    box = cv2.boxPoints(cv2.minAreaRect(max(cnts, key=cv2.contourArea))).astype(np.float32)
+
+    tight = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    tc, _ = cv2.findContours(tight, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    hull = cv2.convexHull(max(tc, key=cv2.contourArea))
+    for eps in np.linspace(0.01, 0.1, 19):
+        ap = cv2.approxPolyDP(hull, eps * cv2.arcLength(hull, True), True)
+        if len(ap) == 4:
+            quad = ap.reshape(4, 2).astype(np.float32)
+            if cv2.contourArea(quad) > 0.6 * cv2.contourArea(box):
+                return quad
+            break
+    return box
+
+
+def _dm_warp_square(gray: np.ndarray, quad: np.ndarray, out: int = 480, grow: float = 1.16) -> np.ndarray:
+    quad = quad.mean(0) + (quad - quad.mean(0)) * grow
+    s = quad.sum(1)
+    d = np.diff(quad, axis=1).ravel()
+    src = np.float32([quad[np.argmin(s)], quad[np.argmin(d)], quad[np.argmax(s)], quad[np.argmax(d)]])
+    dst = np.float32([[0, 0], [out - 1, 0], [out - 1, out - 1], [0, out - 1]])
+    return cv2.warpPerspective(gray, cv2.getPerspectiveTransform(src, dst), (out, out),
+                               flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+
+def _dm_sample_grid(w: np.ndarray, n: int, ext: tuple[int, int, int, int]) -> np.ndarray:
+    x0, y0, x1, y1 = ext
+    small = cv2.resize(w[y0:y1, x0:x1].astype(np.float32), (n * 4, n * 4), interpolation=cv2.INTER_AREA)
+    return small.reshape(n, 4, n, 4)[:, 1:3, :, 1:3].mean((1, 3))
+
+
+def _dm_pattern_score(bits: np.ndarray) -> float:
+    """Matches of the known finder L (left+bottom) and clock (top+right) modules in excess of chance."""
+    n = bits.shape[0]
+    idx = np.arange(n)
+    exp_top = (idx % 2 == 0).astype(int)
+    exp_right = ((n - 1 - idx) % 2 == 0).astype(int)
+    correct = (bits[:, 0].sum() + bits[-1, :].sum()
+               + (bits[0, 1:-1] == exp_top[1:-1]).sum() + (bits[1:-1, -1] == exp_right[1:-1]).sum())
+    return float(correct - (2 * n + 2 * (n - 2)) / 2)
+
+
+def _dm_ecc_hypotheses(gray: np.ndarray, top: int = 60) -> tuple[np.ndarray, list[tuple[float, int, tuple[int, int, int, int], int]]]:
+    w = _dm_warp_square(gray, _dm_locate_quad(gray))
+    h = w.shape[0]
+    step = max(1, h // 80)
+    offs = [-5 * step, -3 * step, -step, 0, step, 3 * step, 5 * step]
+    base = int(h * (1 - 1 / 1.16) / 2)
+    out = []
+    for n in _DM_ECC_SIZES:
+        for a in offs:
+            for b in offs:
+                for c in offs:
+                    for d in offs:
+                        ext = (base + a, base + b, h - base + c, h - base + d)
+                        soft = _dm_sample_grid(w, n, ext)
+                        thr = cv2.threshold(soft.astype(np.uint8), 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[0]
+                        bits = (soft < thr).astype(int)
+                        for rot in range(4):
+                            out.append((_dm_pattern_score(np.rot90(bits, rot)), n, ext, rot))
+    out.sort(key=lambda t: -t[0])
+    return w, out[:top]
+
+
+def _dm_bit_variants(soft: np.ndarray):
+    """Global Otsu and local-neighbourhood thresholds (the latter copes with shadow bands)."""
+    thr = cv2.threshold(soft.astype(np.uint8), 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[0]
+    dark, light = soft[soft < thr], soft[soft >= thr]
+    sep = max(float(light.mean() - dark.mean()), 1.0) if dark.size and light.size else 1.0
+    local = cv2.blur(soft.astype(np.float32), (5, 5), borderType=cv2.BORDER_REPLICATE)
+    yield "global", (soft < thr).astype(int), np.abs(soft - thr) / sep
+    yield "local", (soft < local).astype(int), np.abs(soft - local) / sep
+
+
+def _dm_rs_correct(cw: np.ndarray, conf: np.ndarray, n: int) -> tuple[np.ndarray, int, int] | None:
+    """Erase the k least-confident codewords for growing k; accept only if >= _DM_ECC_SPARE ECC symbols stay spare."""
+    ne = _DM_ECC[n][1]
+    rsc = reedsolo.RSCodec(ne, nsize=255, fcr=1, prim=0x12D, generator=2)
+    order = np.argsort(conf)
+    for k in range(0, ne - _DM_ECC_SPARE + 1):
+        erase = [int(i) for i in order[:k]]
+        try:
+            _, full, errata = rsc.decode(bytearray(int(x) for x in cw), erase_pos=erase)
+        except reedsolo.ReedSolomonError:
+            continue
+        unknown = len({int(i) for i in errata} - set(erase))
+        if k + 2 * unknown <= ne - _DM_ECC_SPARE and all(rsc.check(bytearray(full))):
+            full_arr = np.array(list(full), int)
+            return full_arr, k, int((full_arr != cw).sum())
+    return None
+
+
+def _ecc_reconstruction_decode(roi: np.ndarray, steps: list[StepLog]) -> dict[str, Any]:
+    """Last-resort stage: fit the module grid on the finder/clock pattern, repair codewords with RS, re-decode with ZXing."""
+    t0 = time.perf_counter()
+    fail: dict[str, Any] = {
+        "decoded": False, "text": "", "format": "", "variant": "", "attempts": 0,
+        "steps": steps, "reason": "ecc_reconstruction_failed", "candidate_rows": [],
+    }
+    if reedsolo is None:
+        fail["reason"] = "ecc_unavailable_reedsolo_missing"
+        return fail
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
+    w, hyps = _dm_ecc_hypotheses(gray)
+    base_cfg = {
+        "formats": _DM_FORMAT, "try_rotate": True, "try_downscale": False,
+        "try_harder": True, "binarizer": "LOCAL_AVERAGE", "text_mode": None,
+    }
+    tried = 0
+    for score, n, ext, rot in hyps:
+        soft = np.rot90(_dm_sample_grid(w, n, ext), rot)
+        for vname, bits, margin in _dm_bit_variants(soft):
+            tried += 1
+            cw, conf = _dm_grid_to_codewords(bits[1:-1, 1:-1], margin[1:-1, 1:-1], n)
+            fixed = _dm_rs_correct(cw, conf, n)
+            if fixed is None:
+                continue
+            full, k_erase, n_changed = fixed
+            clean = _dm_codewords_to_bitmap(full, n)
+            decoded = _decode_with_config(clean, base_config=base_cfg)
+            txt = next(((d.text or "").strip() for d in decoded or [] if (d.text or "").strip()), "")
+            if not txt:
+                continue
+            name = f"ecc_n{n}_{vname}"
+            steps.append(StepLog(
+                phase="ecc_reconstruct", step=name, elapsed_ms=(time.perf_counter() - t0) * 1000.0, success=True,
+                detail=f"grid_score={score:.0f} erasures={k_erase} codewords_changed={n_changed} text={txt[:80]}",
+            ))
+            row = _make_success_candidate_row(
+                image_name="", text=txt, fmt="DataMatrix", method="reconstruction_fallback", variant=name,
+                reason="decoded_ecc_reconstruction", image=clean, pass_idx=tried,
+            )
+            return {
+                "decoded": True, "text": txt, "format": "DataMatrix", "variant": name, "attempts": tried,
+                "steps": steps, "reason": "decoded_ecc_reconstruction", "candidate_rows": [row],
+            }
+
+    steps.append(StepLog(
+        phase="ecc_reconstruct", step="rs_fit", elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+        success=False, detail=f"hypotheses_tried={tried}",
+    ))
+    fail["attempts"] = tried
+    return fail
 
 
 def _make_success_candidate_row(
